@@ -1404,6 +1404,14 @@ impl ModelClientSession {
                 )
                 .await
             }
+            WireApi::Anthropic => {
+                crate::anthropic::stream_anthropic_messages(
+                    prompt,
+                    model_info,
+                    &self.client.state.provider,
+                )
+                .await
+            }
         }
     }
 

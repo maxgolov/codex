@@ -33,6 +33,8 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
+const ANTHROPIC_PROVIDER_NAME: &str = "Anthropic";
+pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -44,12 +46,15 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
+    /// Anthropic Messages API at `/v1/messages`.
+    Anthropic,
 }
 
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Responses => "responses",
+            Self::Anthropic => "anthropic",
         };
         f.write_str(value)
     }
@@ -63,8 +68,12 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
+            "anthropic" => Ok(Self::Anthropic),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "anthropic"],
+            )),
         }
     }
 }
@@ -324,6 +333,7 @@ pub fn built_in_model_providers(
     // `model_providers` in config.toml to add their own providers.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
+        (ANTHROPIC_PROVIDER_ID, create_anthropic_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
@@ -336,6 +346,47 @@ pub fn built_in_model_providers(
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect()
+}
+
+/// Create the built-in Anthropic provider entry.
+pub fn create_anthropic_provider() -> ModelProviderInfo {
+    let base_url = std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
+
+    ModelProviderInfo {
+        name: ANTHROPIC_PROVIDER_NAME.into(),
+        base_url: Some(base_url),
+        env_key: None,
+        env_key_instructions: Some(
+            "Get your API key at https://console.anthropic.com/settings/keys and set ANTHROPIC_API_KEY"
+                .to_string(),
+        ),
+        experimental_bearer_token: None,
+        auth: None,
+        wire_api: WireApi::Anthropic,
+        query_params: None,
+        http_headers: Some(
+            [
+                ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        env_http_headers: Some(
+            [("x-api-key".to_string(), "ANTHROPIC_API_KEY".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    }
 }
 
 pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo {

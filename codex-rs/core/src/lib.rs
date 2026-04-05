@@ -5,6 +5,8 @@
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+mod anthropic;
+mod anthropic_types;
 mod apply_patch;
 mod apps;
 mod arc_monitor;

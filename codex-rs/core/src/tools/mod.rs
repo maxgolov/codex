@@ -1,3 +1,4 @@
+pub(crate) mod anthropic_tools;
 pub mod code_mode;
 pub mod context;
 pub mod events;
