@@ -13,6 +13,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -348,6 +349,11 @@ async fn process_anthropic_response(
     let mut response_id = String::new();
     let mut assistant_item: Option<ResponseItem> = None;
 
+    // Token usage tracking: accumulated from message_start and message_delta SSE events.
+    let mut input_tokens: i64 = 0;
+    let mut output_tokens: i64 = 0;
+    let mut cached_input_tokens: i64 = 0;
+
     loop {
         let sse = match timeout(idle_timeout, stream.next()).await {
             Ok(Some(Ok(ev))) => ev,
@@ -361,7 +367,13 @@ async fn process_anthropic_response(
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {
                         response_id,
-                        token_usage: None,
+                        token_usage: Some(TokenUsage {
+                            input_tokens,
+                            cached_input_tokens,
+                            output_tokens,
+                            reasoning_output_tokens: 0,
+                            total_tokens: input_tokens + output_tokens,
+                        }),
                     }))
                     .await;
                 return;
@@ -390,6 +402,9 @@ async fn process_anthropic_response(
         match event {
             StreamEvent::MessageStart { message } => {
                 response_id = message.id;
+                input_tokens = i64::from(message.usage.input_tokens);
+                output_tokens = i64::from(message.usage.output_tokens);
+                cached_input_tokens = i64::from(message.usage.cache_read_input_tokens.unwrap_or(0));
                 let _ = tx_event.send(Ok(ResponseEvent::Created)).await;
             }
 
@@ -512,7 +527,9 @@ async fn process_anthropic_response(
                 }
             }
 
-            StreamEvent::MessageDelta { delta, .. } => {
+            StreamEvent::MessageDelta { delta, usage } => {
+                // message_delta carries the final cumulative output token count.
+                output_tokens = i64::from(usage.output_tokens);
                 if let Some(stop_reason) = delta.stop_reason {
                     use crate::anthropic_types::StopReason;
                     match stop_reason {
@@ -533,7 +550,13 @@ async fn process_anthropic_response(
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {
                         response_id: response_id.clone(),
-                        token_usage: None,
+                        token_usage: Some(TokenUsage {
+                            input_tokens,
+                            cached_input_tokens,
+                            output_tokens,
+                            reasoning_output_tokens: 0,
+                            total_tokens: input_tokens + output_tokens,
+                        }),
                     }))
                     .await;
                 return;

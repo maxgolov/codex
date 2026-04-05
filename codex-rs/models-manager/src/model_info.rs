@@ -59,6 +59,14 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+
+    // Claude models have a 200k context window; use the generic fallback otherwise.
+    let context_window = if slug.starts_with("claude-") {
+        Some(200_000)
+    } else {
+        Some(272_000)
+    };
+
     ModelInfo {
         slug: slug.to_string(),
         display_name: slug.to_string(),
@@ -82,7 +90,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
-        context_window: Some(272_000),
+        context_window,
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),

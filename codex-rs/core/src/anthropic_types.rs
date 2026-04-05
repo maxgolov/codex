@@ -146,7 +146,6 @@ pub(crate) enum StreamEvent {
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: MessageDelta,
-        #[allow(dead_code)]
         usage: MessageDeltaUsage,
     },
     #[serde(rename = "message_stop")]
@@ -176,7 +175,6 @@ pub(crate) struct StreamMessageStart {
     pub role: String,
     #[allow(dead_code)]
     pub model: String,
-    #[allow(dead_code)]
     pub usage: Usage,
 }
 
@@ -187,7 +185,6 @@ pub(crate) struct MessageDelta {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessageDeltaUsage {
-    #[allow(dead_code)]
     pub output_tokens: u32,
 }
 
