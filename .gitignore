@@ -93,3 +93,4 @@ __pycache__/
 *.pyc
 
 .env.secret
+hello_world
