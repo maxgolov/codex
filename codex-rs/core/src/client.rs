@@ -1412,6 +1412,14 @@ impl ModelClientSession {
                 )
                 .await
             }
+            WireApi::Nemotron => {
+                crate::nemotron::stream_nemotron_chat(
+                    prompt,
+                    model_info,
+                    &self.client.state.provider,
+                )
+                .await
+            }
         }
     }
 

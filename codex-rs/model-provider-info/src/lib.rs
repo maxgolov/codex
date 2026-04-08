@@ -35,6 +35,8 @@ const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 const ANTHROPIC_PROVIDER_NAME: &str = "Anthropic";
 pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
+const NEMOTRON_PROVIDER_NAME: &str = "Nemotron";
+pub const NEMOTRON_PROVIDER_ID: &str = "nemotron";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -48,6 +50,12 @@ pub enum WireApi {
     Responses,
     /// Anthropic Messages API at `/v1/messages`.
     Anthropic,
+    /// Nemotron/vLLM Chat Completions API at `/v1/chat/completions`.
+    ///
+    /// This wire API handles Nemotron-specific quirks including `<think>` tag
+    /// extraction, `chat_template_kwargs.thinking_budget` injection, and JSON
+    /// schema flattening for vLLM compatibility.
+    Nemotron,
 }
 
 impl fmt::Display for WireApi {
@@ -55,6 +63,7 @@ impl fmt::Display for WireApi {
         let value = match self {
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
+            Self::Nemotron => "nemotron",
         };
         f.write_str(value)
     }
@@ -69,10 +78,11 @@ impl<'de> Deserialize<'de> for WireApi {
         match value.as_str() {
             "responses" => Ok(Self::Responses),
             "anthropic" => Ok(Self::Anthropic),
+            "nemotron" => Ok(Self::Nemotron),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
             _ => Err(serde::de::Error::unknown_variant(
                 &value,
-                &["responses", "anthropic"],
+                &["responses", "anthropic", "nemotron"],
             )),
         }
     }
@@ -334,6 +344,7 @@ pub fn built_in_model_providers(
     [
         (OPENAI_PROVIDER_ID, openai_provider),
         (ANTHROPIC_PROVIDER_ID, create_anthropic_provider()),
+        (NEMOTRON_PROVIDER_ID, create_nemotron_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
@@ -380,6 +391,50 @@ pub fn create_anthropic_provider() -> ModelProviderInfo {
                 .into_iter()
                 .collect(),
         ),
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    }
+}
+
+/// Default vLLM port used when `NVIDIA_BASE_URL` is not set.
+const DEFAULT_NEMOTRON_PORT: u16 = 8002;
+
+/// Create the built-in Nemotron/vLLM provider entry.
+pub fn create_nemotron_provider() -> ModelProviderInfo {
+    let base_url = std::env::var("NVIDIA_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("http://localhost:{DEFAULT_NEMOTRON_PORT}/v1"));
+
+    // Ensure the URL ends with /v1 for vLLM compatibility.
+    let base_url = if base_url.ends_with("/v1") {
+        base_url
+    } else {
+        format!("{}/v1", base_url.trim_end_matches('/'))
+    };
+
+    ModelProviderInfo {
+        name: NEMOTRON_PROVIDER_NAME.into(),
+        base_url: Some(base_url),
+        env_key: None,
+        env_key_instructions: Some(
+            "Nemotron runs locally via vLLM — no API key needed. Set NVIDIA_BASE_URL to override the endpoint."
+                .to_string(),
+        ),
+        experimental_bearer_token: None,
+        auth: None,
+        wire_api: WireApi::Nemotron,
+        query_params: None,
+        http_headers: Some(
+            [("content-type".to_string(), "application/json".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        env_http_headers: None,
         request_max_retries: None,
         stream_max_retries: None,
         stream_idle_timeout_ms: None,

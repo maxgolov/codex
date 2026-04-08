@@ -60,9 +60,12 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
 
-    // Claude models have a 200k context window; use the generic fallback otherwise.
+    // Claude models have a 200k context window; Nemotron models use 128k;
+    // use the generic fallback otherwise.
     let context_window = if slug.starts_with("claude-") {
         Some(200_000)
+    } else if slug.contains("nemotron") || slug.contains("Nemotron") {
+        Some(128_000)
     } else {
         Some(272_000)
     };

@@ -1901,6 +1901,20 @@
             "responses"
           ],
           "type": "string"
+        },
+        {
+          "description": "Anthropic Messages API at `/v1/messages`.",
+          "enum": [
+            "anthropic"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Nemotron/vLLM Chat Completions API at `/v1/chat/completions`.\n\nThis wire API handles Nemotron-specific quirks including `<think>` tag extraction, `chat_template_kwargs.thinking_budget` injection, and JSON schema flattening for vLLM compatibility.",
+          "enum": [
+            "nemotron"
+          ],
+          "type": "string"
         }
       ]
     }

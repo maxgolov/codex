@@ -10,6 +10,9 @@ mod anthropic_types;
 mod apply_patch;
 mod apps;
 mod arc_monitor;
+pub mod nemotron;
+mod nemotron_types;
+
 mod client;
 mod client_common;
 pub mod codex;
