@@ -105,6 +105,7 @@ mod model_switching;
 mod model_visible_layout;
 mod models_cache_ttl;
 mod models_etag_responses;
+mod nemotron_integration;
 mod otel;
 mod pending_input;
 mod permissions_messages;

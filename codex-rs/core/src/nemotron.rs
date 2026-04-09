@@ -56,6 +56,15 @@ const MIN_THINKING_BUDGET: u32 = 1024;
 /// Default thinking budget when reasoning is enabled.
 const DEFAULT_THINKING_BUDGET: u32 = 4096;
 
+/// Default per-request timeout in seconds. If the HTTP POST does not receive
+/// first byte within this window the attempt is abandoned and retried (the
+/// "nudge" behaviour). Override via `NEMOTRON_REQUEST_TIMEOUT`.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// After a request timeout, the thinking budget is reduced by this factor
+/// on the retry to give vLLM a better chance of responding in time.
+const THINKING_BUDGET_REDUCTION_FACTOR: u32 = 2;
+
 /// Resolve the model slug for a Nemotron/vLLM endpoint.
 ///
 /// - If `slug` is `"auto"` or `"*"`, queries `/v1/models` and returns the
@@ -64,10 +73,7 @@ const DEFAULT_THINKING_BUDGET: u32 = 4096;
 ///   is found, picks the best substring match (the model whose `id` contains
 ///   `slug` as a case-insensitive substring, preferring the shortest match).
 /// - Returns an error only when no model can be matched.
-async fn resolve_nemotron_model(
-    slug: &str,
-    provider: &ModelProviderInfo,
-) -> Result<String> {
+async fn resolve_nemotron_model(slug: &str, provider: &ModelProviderInfo) -> Result<String> {
     let is_auto = slug.eq_ignore_ascii_case("auto") || slug == "*";
 
     // If the slug looks like a fully-qualified model ID (not auto), try it
@@ -99,9 +105,7 @@ async fn resolve_nemotron_model(
         .headers(header_map)
         .send()
         .await
-        .map_err(|e| {
-            CodexErr::UnsupportedOperation(format!("Failed to query {url}: {e}"))
-        })?;
+        .map_err(|e| CodexErr::UnsupportedOperation(format!("Failed to query {url}: {e}")))?;
 
     if !resp.status().is_success() {
         if is_auto {
@@ -112,7 +116,10 @@ async fn resolve_nemotron_model(
         }
         // Fall through — use the slug as-is and let the chat call fail with
         // a more specific error.
-        debug!("/v1/models returned {}; using slug as-is: {slug}", resp.status());
+        debug!(
+            "/v1/models returned {}; using slug as-is: {slug}",
+            resp.status()
+        );
         return Ok(slug.to_string());
     }
 
@@ -350,30 +357,19 @@ pub async fn stream_nemotron_chat(
     };
 
     // ── Thinking budget ─────────────────────────────────────────────────
-    let thinking_budget = std::env::var("NEMOTRON_THINKING_BUDGET")
+    let initial_thinking_budget = std::env::var("NEMOTRON_THINKING_BUDGET")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_THINKING_BUDGET)
         .max(MIN_THINKING_BUDGET);
 
-    // ── Build request ───────────────────────────────────────────────────
-    let request = ChatCompletionRequest {
-        model: &resolved_model,
-        messages,
-        temperature: None, // Nemotron reasoning models may reject temperature
-        max_tokens: Some(DEFAULT_MAX_TOKENS),
-        tools: tools_param,
-        tool_choice,
-        chat_template_kwargs: Some(ChatTemplateKwargs { thinking_budget }),
-        stream: true,
-        stream_options: Some(StreamOptions {
-            include_usage: true,
-        }),
-    };
-
-    let payload = serde_json::to_value(&request).map_err(|e| {
-        CodexErr::UnsupportedOperation(format!("Failed to serialize Nemotron request: {e}"))
-    })?;
+    // ── Request timeout ─────────────────────────────────────────────────
+    let request_timeout = Duration::from_secs(
+        std::env::var("NEMOTRON_REQUEST_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+    );
 
     // ── Resolve URL + headers from provider ─────────────────────────────
     let api_provider = provider.to_api_provider(/*auth_mode*/ None)?;
@@ -389,12 +385,37 @@ pub async fn stream_nemotron_chat(
 
     debug!("Nemotron POST to {url}");
 
-    // ── Execute with retries ────────────────────────────────────────────
-    let http_client = reqwest::Client::new();
+    // ── Execute with retries + nudge on timeout ─────────────────────────
+    let http_client = reqwest::Client::builder()
+        .timeout(request_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut attempt = 0;
     let max_retries = provider.request_max_retries();
+    let mut thinking_budget = initial_thinking_budget;
     loop {
         attempt += 1;
+
+        // Rebuild payload each iteration since thinking_budget may shrink.
+        let request = ChatCompletionRequest {
+            model: &resolved_model,
+            messages: messages.clone(),
+            temperature: None,
+            max_tokens: Some(DEFAULT_MAX_TOKENS),
+            tools: tools_param.clone(),
+            tool_choice,
+            chat_template_kwargs: Some(ChatTemplateKwargs { thinking_budget }),
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+        };
+
+        let payload = serde_json::to_value(&request).map_err(|e| {
+            CodexErr::UnsupportedOperation(format!("Failed to serialize Nemotron request: {e}"))
+        })?;
+
+        debug!("Nemotron attempt {attempt}/{max_retries} (thinking_budget={thinking_budget})");
 
         let res = http_client
             .post(&url)
@@ -449,6 +470,21 @@ pub async fn stream_nemotron_chat(
                         "Nemotron connection failed after retries: {e}"
                     )));
                 }
+
+                // Nudge: if the error looks like a timeout, reduce the
+                // thinking budget on the next attempt so vLLM has less
+                // work to do and is more likely to respond in time.
+                if e.is_timeout() {
+                    let reduced = (thinking_budget / THINKING_BUDGET_REDUCTION_FACTOR)
+                        .max(MIN_THINKING_BUDGET);
+                    tracing::warn!(
+                        "Nemotron request timed out after {request_timeout:?}; \
+                         nudging with reduced thinking_budget {thinking_budget} → {reduced} \
+                         (attempt {attempt}/{max_retries})"
+                    );
+                    thinking_budget = reduced;
+                }
+
                 let delay = backoff(attempt);
                 tokio::time::sleep(delay).await;
             }
@@ -985,9 +1021,7 @@ mod tests {
 
     #[test]
     fn test_pick_best_model_case_insensitive() {
-        let models = vec![
-            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-        ];
+        let models = vec!["nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"];
         assert_eq!(
             pick_best_model("nemotron-3-nano", &models),
             Some("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
