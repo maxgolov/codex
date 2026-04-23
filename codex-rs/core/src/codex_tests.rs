@@ -15,7 +15,7 @@ use crate::tools::format_exec_output_str;
 
 use codex_features::Features;
 use codex_login::CodexAuth;
-use codex_mcp::mcp_connection_manager::ToolInfo;
+use codex_mcp::ToolInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::model_info;
@@ -36,14 +36,13 @@ use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use tracing::Span;
 
+use crate::RolloutRecorderParams;
 use crate::rollout::policy::EventPersistenceMode;
 use crate::rollout::recorder::RolloutRecorder;
-use crate::rollout::recorder::RolloutRecorderParams;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ShellHandler;
@@ -76,6 +75,9 @@ use codex_protocol::protocol::NetworkApprovalProtocol;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::RealtimeAudioFrame;
+use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
+use codex_protocol::protocol::RealtimeVoice;
+use codex_protocol::protocol::RealtimeVoicesList;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::Submission;
@@ -120,15 +122,9 @@ use std::time::Duration as StdDuration;
 #[path = "codex_tests_guardian.rs"]
 mod guardian_tests;
 
-use codex_protocol::models::function_call_output_content_items_to_text;
-
-fn expect_text_tool_output(output: &FunctionToolOutput) -> String {
-    function_call_output_content_items_to_text(&output.body).unwrap_or_default()
-}
-
 struct InstructionsTestCase {
     slug: &'static str,
-    expects_apply_patch_instructions: bool,
+    expects_apply_patch_description: bool,
 }
 
 fn user_message(text: &str) -> ResponseItem {
@@ -242,13 +238,19 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
         .await
         .expect("expected turn aborted event")
         .expect("channel open");
-    assert!(matches!(
-        second.msg,
-        EventMsg::TurnAborted(TurnAbortedEvent {
-            turn_id: Some(turn_id),
-            reason: TurnAbortReason::Interrupted,
-        }) if turn_id == tc.sub_id
-    ));
+    let EventMsg::TurnAborted(TurnAbortedEvent {
+        turn_id,
+        reason,
+        completed_at,
+        duration_ms,
+    }) = second.msg
+    else {
+        panic!("expected turn aborted event");
+    };
+    assert_eq!(turn_id, Some(tc.sub_id.clone()));
+    assert_eq!(reason, TurnAbortReason::Interrupted);
+    assert!(completed_at.is_some());
+    assert!(duration_ms.is_some());
 }
 
 fn test_model_client_session() -> crate::client::ModelClientSession {
@@ -256,6 +258,7 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         /*auth_manager*/ None,
         ThreadId::try_from("00000000-0000-4000-8000-000000000001")
             .expect("test thread id should be valid"),
+        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
         ModelProviderInfo::create_openai_provider(/* base_url */ /*base_url*/ None),
         codex_protocol::protocol::SessionSource::Exec,
         /*model_verbosity*/ None,
@@ -305,6 +308,7 @@ fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> T
         &turn_context.tools_config,
         crate::tools::router::ToolRouterParams {
             mcp_tools: None,
+            tool_namespaces: None,
             app_tools: None,
             discoverable_tools: None,
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
@@ -413,6 +417,7 @@ fn make_mcp_tool(
         server_name: server_name.to_string(),
         tool_name: tool_name.to_string(),
         tool_namespace,
+        server_instructions: None,
         tool: Tool {
             name: tool_name.to_string().into(),
             title: None,
@@ -545,6 +550,139 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
 }
 
 #[tokio::test]
+async fn managed_network_proxy_refreshes_when_sandbox_policy_changes() -> anyhow::Result<()> {
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig::default(),
+        Some(NetworkConstraints {
+            domains: Some(NetworkDomainPermissionsToml {
+                entries: std::collections::BTreeMap::from([(
+                    "blocked.example.com".to_string(),
+                    NetworkDomainPermissionToml::Deny,
+                )]),
+            }),
+            danger_full_access_denylist_only: Some(true),
+            allow_local_binding: Some(false),
+            ..Default::default()
+        }),
+        &SandboxPolicy::new_workspace_write_policy(),
+    )?;
+    let exec_policy = Policy::empty();
+
+    let (started_proxy, _) = Session::start_managed_network_proxy(
+        &spec,
+        &exec_policy,
+        &SandboxPolicy::new_workspace_write_policy(),
+        /*network_policy_decider*/ None,
+        /*blocked_request_observer*/ None,
+        /*managed_network_requirements_enabled*/ false,
+        crate::config::NetworkProxyAuditMetadata::default(),
+    )
+    .await?;
+
+    assert!(!started_proxy.proxy().allow_local_binding());
+    let current_cfg = started_proxy.proxy().current_cfg().await?;
+    assert_eq!(current_cfg.network.allowed_domains(), None);
+    assert_eq!(
+        current_cfg.network.denied_domains(),
+        Some(vec!["blocked.example.com".to_string()])
+    );
+
+    let spec = spec.recompute_for_sandbox_policy(&SandboxPolicy::DangerFullAccess)?;
+    spec.apply_to_started_proxy(&started_proxy).await?;
+
+    assert!(started_proxy.proxy().allow_local_binding());
+    let current_cfg = started_proxy.proxy().current_cfg().await?;
+    assert_eq!(
+        current_cfg.network.allowed_domains(),
+        Some(vec!["*".to_string()])
+    );
+    assert_eq!(
+        current_cfg.network.denied_domains(),
+        Some(vec!["blocked.example.com".to_string()])
+    );
+
+    let spec = spec.recompute_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy())?;
+    spec.apply_to_started_proxy(&started_proxy).await?;
+
+    assert!(!started_proxy.proxy().allow_local_binding());
+    let current_cfg = started_proxy.proxy().current_cfg().await?;
+    assert_eq!(current_cfg.network.allowed_domains(), None);
+    assert_eq!(
+        current_cfg.network.denied_domains(),
+        Some(vec!["blocked.example.com".to_string()])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::Result<()> {
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig::default(),
+        Some(NetworkConstraints {
+            enabled: Some(true),
+            danger_full_access_denylist_only: Some(true),
+            ..Default::default()
+        }),
+        &SandboxPolicy::DangerFullAccess,
+    )?;
+    let exec_policy = Policy::empty();
+    let decider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let network_policy_decider: Arc<dyn codex_network_proxy::NetworkPolicyDecider> = Arc::new({
+        let decider_calls = Arc::clone(&decider_calls);
+        move |_request| {
+            decider_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { codex_network_proxy::NetworkDecision::ask("not_allowed") }
+        }
+    });
+
+    let (started_proxy, _) = Session::start_managed_network_proxy(
+        &spec,
+        &exec_policy,
+        &SandboxPolicy::DangerFullAccess,
+        Some(network_policy_decider),
+        /*blocked_request_observer*/ None,
+        /*managed_network_requirements_enabled*/ true,
+        crate::config::NetworkProxyAuditMetadata::default(),
+    )
+    .await?;
+
+    let spec = spec.recompute_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy())?;
+    spec.apply_to_started_proxy(&started_proxy).await?;
+    let current_cfg = started_proxy.proxy().current_cfg().await?;
+    assert_eq!(current_cfg.network.allowed_domains(), None);
+
+    use tokio::io::AsyncReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut stream = tokio::net::TcpStream::connect(started_proxy.proxy().http_addr()).await?;
+    stream
+        .write_all(
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let mut buffer = [0_u8; 4096];
+    let bytes_read = tokio::time::timeout(StdDuration::from_secs(2), stream.read(&mut buffer))
+        .await
+        .expect("timed out waiting for proxy response")?;
+    let response = String::from_utf8_lossy(&buffer[..bytes_read]);
+
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden"),
+        "unexpected proxy response: {response}"
+    );
+    assert!(
+        response.contains("x-proxy-error: blocked-by-allowlist"),
+        "unexpected proxy response: {response}"
+    );
+    assert_eq!(
+        decider_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "unexpected proxy response: {response}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_base_instructions_no_user_content() {
     let prompt_with_apply_patch_instructions =
         include_str!("../prompt_with_apply_patch_instructions.md");
@@ -562,19 +700,19 @@ async fn get_base_instructions_no_user_content() {
     let test_cases = vec![
         InstructionsTestCase {
             slug: "gpt-5",
-            expects_apply_patch_instructions: false,
+            expects_apply_patch_description: false,
         },
         InstructionsTestCase {
             slug: "gpt-5.1",
-            expects_apply_patch_instructions: false,
+            expects_apply_patch_description: false,
         },
         InstructionsTestCase {
             slug: "gpt-5.1-codex",
-            expects_apply_patch_instructions: false,
+            expects_apply_patch_description: false,
         },
         InstructionsTestCase {
             slug: "gpt-5.1-codex-max",
-            expects_apply_patch_instructions: false,
+            expects_apply_patch_description: false,
         },
     ];
 
@@ -583,7 +721,7 @@ async fn get_base_instructions_no_user_content() {
 
     for test_case in test_cases {
         let model_info = model_info_for_slug(test_case.slug, &config);
-        if test_case.expects_apply_patch_instructions {
+        if test_case.expects_apply_patch_description {
             assert_eq!(
                 model_info.base_instructions.as_str(),
                 prompt_with_apply_patch_instructions
@@ -1307,6 +1445,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1324,6 +1463,8 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
     ];
@@ -1488,6 +1629,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1506,10 +1648,13 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: first_turn_id,
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: rolled_back_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1528,6 +1673,8 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: rolled_back_turn_id,
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         })),
     ])
     .await;
@@ -1586,6 +1733,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1602,10 +1750,13 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: first_turn_id,
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: compact_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1617,10 +1768,13 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: compact_turn_id,
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: rolled_back_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1641,6 +1795,8 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: rolled_back_turn_id,
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         })),
     ])
     .await;
@@ -1668,6 +1824,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: "turn-1".to_string(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1684,10 +1841,13 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: "turn-2".to_string(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1704,10 +1864,13 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-2".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: "turn-3".to_string(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1724,6 +1887,8 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-3".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         })),
     ])
     .await;
@@ -2193,7 +2358,7 @@ async fn attach_rollout_recorder(session: &Arc<Session>) -> PathBuf {
     let recorder = RolloutRecorder::new(
         config.as_ref(),
         RolloutRecorderParams::new(
-            ThreadId::default(),
+            session.conversation_id,
             /*forked_from_id*/ None,
             SessionSource::Exec,
             BaseInstructions::default(),
@@ -2223,7 +2388,7 @@ fn text_block(s: &str) -> serde_json::Value {
 }
 
 async fn build_test_config(codex_home: &Path) -> Config {
-    ConfigBuilder::default()
+    ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.to_path_buf())
         .build()
         .await
@@ -2477,10 +2642,7 @@ async fn session_configuration_apply_rederives_legacy_file_system_policy_on_cwd_
 #[tokio::test]
 async fn session_update_settings_keeps_runtime_cwds_absolute() {
     let (session, turn_context) = make_session_and_context().await;
-    let updated_cwd = turn_context
-        .cwd
-        .join("project")
-        .expect("resolve project dir");
+    let updated_cwd = turn_context.cwd.join("project");
     std::fs::create_dir_all(updated_cwd.as_path()).expect("create project dir");
 
     session
@@ -2586,14 +2748,16 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         agent_status_tx,
         InitialHistory::New,
         SessionSource::Exec,
-        Arc::new(codex_exec_server::EnvironmentManager::new(
-            /*exec_server_url*/ None,
-        )),
         skills_manager,
         plugins_manager,
         mcp_manager,
         Arc::new(SkillsWatcher::noop()),
         AgentControl::default(),
+        Some(Arc::new(
+            codex_exec_server::Environment::create(/*exec_server_url*/ None)
+                .await
+                .expect("create environment"),
+        )),
     )
     .await;
 
@@ -2698,6 +2862,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let services = SessionServices {
         mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::new_uninitialized(
             &config.permissions.approval_policy,
+            &config.permissions.sandbox_policy,
         ))),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::new(
@@ -2723,6 +2888,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         session_telemetry: session_telemetry.clone(),
         models_manager: Arc::clone(&models_manager),
         tool_approvals: Mutex::new(ApprovalStore::default()),
+        guardian_rejection_rationales: Mutex::new(std::collections::HashMap::new()),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -2734,6 +2900,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         model_client: ModelClient::new(
             Some(auth_manager.clone()),
             conversation_id,
+            /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
             session_configuration.provider.clone(),
             session_configuration.session_source.clone(),
             config.model_verbosity,
@@ -2744,7 +2911,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             config.js_repl_node_path.clone(),
         ),
-        environment: Arc::clone(&environment),
+        environment: Some(Arc::clone(&environment)),
     };
     let js_repl = Arc::new(JsReplHandle::with_node_path(
         config.js_repl_node_path.clone(),
@@ -2771,7 +2938,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         model_info,
         &models_manager,
         /*network*/ None,
-        environment,
+        Some(environment),
         "turn_id".to_string(),
         Arc::clone(&js_repl),
         skills_outcome,
@@ -2784,6 +2951,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         agent_status: agent_status_tx,
         out_of_band_elicitation_paused: watch::channel(false).0,
         state: Mutex::new(state),
+        managed_network_proxy_refresh_lock: Mutex::new(()),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
@@ -3538,6 +3706,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let services = SessionServices {
         mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::new_uninitialized(
             &config.permissions.approval_policy,
+            &config.permissions.sandbox_policy,
         ))),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::new(
@@ -3563,6 +3732,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         session_telemetry: session_telemetry.clone(),
         models_manager: Arc::clone(&models_manager),
         tool_approvals: Mutex::new(ApprovalStore::default()),
+        guardian_rejection_rationales: Mutex::new(std::collections::HashMap::new()),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -3574,6 +3744,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         model_client: ModelClient::new(
             Some(Arc::clone(&auth_manager)),
             conversation_id,
+            /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
             session_configuration.provider.clone(),
             session_configuration.session_source.clone(),
             config.model_verbosity,
@@ -3584,7 +3755,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             config.js_repl_node_path.clone(),
         ),
-        environment: Arc::clone(&environment),
+        environment: Some(Arc::clone(&environment)),
     };
     let js_repl = Arc::new(JsReplHandle::with_node_path(
         config.js_repl_node_path.clone(),
@@ -3611,7 +3782,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         model_info,
         &models_manager,
         /*network*/ None,
-        environment,
+        Some(environment),
         "turn_id".to_string(),
         Arc::clone(&js_repl),
         skills_outcome,
@@ -3624,6 +3795,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         agent_status: agent_status_tx,
         out_of_band_elicitation_paused: watch::channel(false).0,
         state: Mutex::new(state),
+        managed_network_proxy_refresh_lock: Mutex::new(()),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
@@ -4057,18 +4229,13 @@ async fn handle_output_item_done_records_image_save_history_message() {
     let image_output_dir = image_output_path
         .parent()
         .expect("generated image path should have a parent");
-    let save_message: ResponseItem = DeveloperInstructions::new(format!(
-        "Generated images are saved to {} as {} by default.",
+    let image_message: ResponseItem = DeveloperInstructions::new(format!(
+        "Generated images are saved to {} as {} by default.\nIf you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.",
         image_output_dir.display(),
         image_output_path.display(),
     ))
     .into();
-    let copy_message: ResponseItem = DeveloperInstructions::new(
-        "If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it."
-            .to_string(),
-    )
-    .into();
-    assert_eq!(history.raw_items(), &[save_message, copy_message, item]);
+    assert_eq!(history.raw_items(), &[image_message, item]);
     assert_eq!(
         std::fs::read(&expected_saved_path).expect("saved file"),
         b"foo"
@@ -4424,6 +4591,51 @@ async fn run_user_shell_command_does_not_set_reference_context_item() {
     );
 }
 
+#[tokio::test]
+async fn realtime_conversation_list_voices_emits_builtin_list() {
+    let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
+
+    handlers::realtime_conversation_list_voices(&session, "sub-id".to_string()).await;
+
+    let event = rx.recv().await.expect("event");
+    let voices = match event.msg {
+        EventMsg::RealtimeConversationListVoicesResponse(
+            RealtimeConversationListVoicesResponseEvent { voices },
+        ) => voices,
+        msg => panic!("expected list voices response, got {msg:?}"),
+    };
+    assert_eq!(
+        voices,
+        RealtimeVoicesList {
+            v1: vec![
+                RealtimeVoice::Juniper,
+                RealtimeVoice::Maple,
+                RealtimeVoice::Spruce,
+                RealtimeVoice::Ember,
+                RealtimeVoice::Vale,
+                RealtimeVoice::Breeze,
+                RealtimeVoice::Arbor,
+                RealtimeVoice::Sol,
+                RealtimeVoice::Cove,
+            ],
+            v2: vec![
+                RealtimeVoice::Alloy,
+                RealtimeVoice::Ash,
+                RealtimeVoice::Ballad,
+                RealtimeVoice::Coral,
+                RealtimeVoice::Echo,
+                RealtimeVoice::Sage,
+                RealtimeVoice::Shimmer,
+                RealtimeVoice::Verse,
+                RealtimeVoice::Marin,
+                RealtimeVoice::Cedar,
+            ],
+            default_v1: RealtimeVoice::Cove,
+            default_v2: RealtimeVoice::Marin,
+        },
+    );
+}
+
 #[derive(Clone, Copy)]
 struct NeverEndingTask {
     kind: TaskKind,
@@ -4631,6 +4843,7 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
         EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id,
             last_agent_message: None,
+            ..
         }) if turn_id == tc.sub_id
     ));
 }
@@ -5133,15 +5346,12 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
             .await
     };
     let app_tools = Some(tools.clone());
+    let mcp_tool_router_inputs = crate::tools::router::map_mcp_tool_infos(&tools);
     let router = ToolRouter::from_config(
         &turn_context.tools_config,
         crate::tools::router::ToolRouterParams {
-            mcp_tools: Some(
-                tools
-                    .into_iter()
-                    .map(|(name, tool)| (name, tool.tool))
-                    .collect(),
-            ),
+            mcp_tools: Some(mcp_tool_router_inputs.mcp_tools),
+            tool_namespaces: Some(mcp_tool_router_inputs.tool_namespaces),
             app_tools,
             discoverable_tools: None,
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
@@ -5348,7 +5558,9 @@ async fn sample_rollout(
 #[tokio::test]
 async fn rejects_escalated_permissions_when_policy_not_on_request() {
     use crate::exec::ExecParams;
+    use crate::exec_policy::ExecApprovalRequest;
     use crate::sandboxing::SandboxPermissions;
+    use crate::tools::sandboxing::ExecApprovalRequirement;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::SandboxPolicy;
@@ -5379,7 +5591,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
                 "echo hi".to_string(),
             ]
         },
-        cwd: turn_context.cwd.to_path_buf(),
+        cwd: turn_context.cwd.clone(),
         expiration: timeout_ms.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
         env: HashMap::new(),
@@ -5391,23 +5603,6 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
             .permissions
             .windows_sandbox_private_desktop,
         justification: Some("test".to_string()),
-        arg0: None,
-    };
-
-    let params2 = ExecParams {
-        sandbox_permissions: SandboxPermissions::UseDefault,
-        command: params.command.clone(),
-        cwd: params.cwd.clone(),
-        expiration: timeout_ms.into(),
-        capture_policy: ExecCapturePolicy::ShellTool,
-        env: HashMap::new(),
-        network: None,
-        windows_sandbox_level: turn_context.windows_sandbox_level,
-        windows_sandbox_private_desktop: turn_context
-            .config
-            .permissions
-            .windows_sandbox_private_desktop,
-        justification: params.justification.clone(),
         arg0: None,
     };
 
@@ -5448,9 +5643,11 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
     );
 
     pretty_assertions::assert_eq!(output, expected);
+    pretty_assertions::assert_eq!(session.granted_turn_permissions().await, None);
 
-    // Now retry the same command WITHOUT escalated permissions; should succeed.
-    // Force DangerFullAccess to avoid platform sandbox dependencies in tests.
+    // The rejection should not poison the non-escalated path for the same
+    // command. Force DangerFullAccess so this check stays focused on approval
+    // policy rather than platform-specific sandbox behavior.
     let turn_context_mut = Arc::get_mut(&mut turn_context).expect("unique turn context Arc");
     turn_context_mut
         .sandbox_policy
@@ -5461,45 +5658,22 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
     turn_context_mut.network_sandbox_policy =
         NetworkSandboxPolicy::from(turn_context_mut.sandbox_policy.get());
 
-    let resp2 = handler
-        .handle(ToolInvocation {
-            session: Arc::clone(&session),
-            turn: Arc::clone(&turn_context),
-            tracker: Arc::clone(&turn_diff_tracker),
-            call_id: "test-call-2".to_string(),
-            tool_name: tool_name.to_string(),
-            tool_namespace: None,
-            payload: ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "command": params2.command.clone(),
-                    "workdir": Some(turn_context.cwd.to_string_lossy().to_string()),
-                    "timeout_ms": params2.expiration.timeout_ms(),
-                    "sandbox_permissions": params2.sandbox_permissions,
-                    "justification": params2.justification.clone(),
-                })
-                .to_string(),
-            },
+    let exec_approval_requirement = session
+        .services
+        .exec_policy
+        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+            command: &params.command,
+            approval_policy: turn_context.approval_policy.value(),
+            sandbox_policy: turn_context.sandbox_policy.get(),
+            file_system_sandbox_policy: &turn_context.file_system_sandbox_policy,
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            prefix_rule: None,
         })
         .await;
-
-    let output = expect_text_tool_output(&resp2.expect("expected Ok result"));
-
-    #[derive(Deserialize, PartialEq, Eq, Debug)]
-    struct ResponseExecMetadata {
-        exit_code: i32,
-    }
-
-    #[derive(Deserialize)]
-    struct ResponseExecOutput {
-        output: String,
-        metadata: ResponseExecMetadata,
-    }
-
-    let exec_output: ResponseExecOutput =
-        serde_json::from_str(&output).expect("valid exec output json");
-
-    pretty_assertions::assert_eq!(exec_output.metadata, ResponseExecMetadata { exit_code: 0 });
-    assert!(exec_output.output.contains("hi"));
+    assert!(matches!(
+        exec_approval_requirement,
+        ExecApprovalRequirement::Skip { .. }
+    ));
 }
 #[tokio::test]
 async fn unified_exec_rejects_escalated_permissions_when_policy_not_on_request() {
