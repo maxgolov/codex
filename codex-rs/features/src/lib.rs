@@ -91,6 +91,8 @@ pub enum Feature {
     ShellZshFork,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
+    /// Stream structured progress while apply_patch input is being generated.
+    ApplyPatchStreamingEvents,
     /// Allow exec tools to request additional permissions while staying sandboxed.
     ExecPermissionApprovals,
     /// Enable Claude-style lifecycle hooks loaded from hooks.json files.
@@ -130,10 +132,10 @@ pub enum Feature {
     Sqlite,
     /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
+    /// Enable the Chronicle sidecar for passive screen-context memories.
+    Chronicle,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
-    /// Allow the model to request `detail: "original"` image outputs on supported models.
-    ImageDetailOriginal,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
     /// Enable collab tools.
@@ -146,10 +148,26 @@ pub enum Feature {
     Apps,
     /// Enable the tool_search tool for apps.
     ToolSearch,
+    /// Always defer MCP tools behind tool_search instead of exposing small sets directly.
+    ToolSearchAlwaysDeferMcpTools,
+    /// Expose placeholder tools for unavailable historical tool calls.
+    UnavailableDummyTools,
     /// Enable discoverable tool suggestions for apps.
     ToolSuggest,
     /// Enable plugins.
     Plugins,
+    /// Allow the in-app browser pane in desktop apps.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppBrowser,
+    /// Allow Browser Use agent integration in desktop apps.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    BrowserUse,
+    /// Temporary internal-only flag for PS-backed remote plugin catalog development.
+    RemotePlugin,
+    /// Show the startup prompt for migrating external agent config into Codex.
+    ExternalMigration,
     /// Allow the model to invoke the built-in image generation tool.
     ImageGeneration,
     /// Allow prompting and installing missing MCP dependencies.
@@ -178,14 +196,21 @@ pub enum Feature {
     RealtimeConversation,
     /// Connect app-server to the ChatGPT remote control service.
     RemoteControl,
+    /// Removed compatibility flag retained as a no-op so old wrappers can
+    /// still pass `--enable image_detail_original`.
+    ImageDetailOriginal,
     /// Removed compatibility flag. The TUI now always uses the app-server implementation.
     TuiAppServer,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
+    /// Enable workspace-specific owner nudge copy and prompts in the TUI.
+    WorkspaceOwnerUsageNudge,
     /// Legacy rollout flag for Responses API WebSocket transport experiments.
     ResponsesWebsockets,
     /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
     ResponsesWebsocketsV2,
+    /// Enable workspace dependency support.
+    WorkspaceDependencies,
 }
 
 impl Feature {
@@ -359,6 +384,15 @@ impl Features {
                 "tui_app_server" => {
                     continue;
                 }
+                "image_detail_original" => {
+                    continue;
+                }
+                "use_legacy_landlock" => {
+                    self.record_legacy_usage_force(
+                        "features.use_legacy_landlock",
+                        Feature::UseLegacyLandlock,
+                    );
+                }
                 _ => {}
             }
             match feature_for_key(k) {
@@ -443,6 +477,19 @@ fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>
             let summary =
                 format!("`{label}` is deprecated because web search is enabled by default.");
             (summary, Some(web_search_details().to_string()))
+        }
+        Feature::UseLegacyLandlock => {
+            let label = match alias {
+                "features.use_legacy_landlock" | "use_legacy_landlock" => {
+                    "[features].use_legacy_landlock"
+                }
+                _ => alias,
+            };
+            let summary = format!("`{label}` is deprecated and will be removed soon.");
+            let details =
+                "Remove this setting to stop opting into the legacy Linux sandbox behavior."
+                    .to_string();
+            (summary, Some(details))
         }
         _ => {
             let label = if alias.contains('.') || alias.starts_with('[') {
@@ -652,8 +699,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GeneralAnalytics,
         key: "general_analytics",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::Sqlite,
@@ -664,6 +711,16 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MemoryTool,
         key: "memories",
+        stage: Stage::Experimental {
+            name: "Memories",
+            menu_description: "Allow Codex to create new memories from conversations and bring relevant memories into new conversations.",
+            announcement: "NEW: Codex can now generate and uses memories. Try is now with `/memories`",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Chronicle,
+        key: "chronicle",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -674,18 +731,14 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::ImageDetailOriginal,
-        key: "image_detail_original",
-        stage: Stage::Experimental {
-            name: "Original image detail",
-            menu_description: "Let the model inspect tool-emitted images at full resolution on supported models instead of a resized approximation. This affects tool-emitted images such as those produced by `view_image`, not images attached directly in the UI. It is particularly important for localization and precise UI targeting, for reading small text, and for reasoning about precise layout.",
-            announcement: "NEW: Original image detail is now available in /experimental. Enable it to let tools request full-resolution image detail on supported models for CUA and localization tasks.",
-        },
+        id: Feature::ApplyPatchFreeform,
+        key: "apply_patch_freeform",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::ApplyPatchFreeform,
-        key: "apply_patch_freeform",
+        id: Feature::ApplyPatchStreamingEvents,
+        key: "apply_patch_streaming_events",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -716,7 +769,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::UseLegacyLandlock,
         key: "use_legacy_landlock",
-        stage: Stage::Stable,
+        stage: Stage::Deprecated,
         default_enabled: false,
     },
     FeatureSpec {
@@ -776,6 +829,18 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ToolSearch,
         key: "tool_search",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ToolSearchAlwaysDeferMcpTools,
+        key: "tool_search_always_defer_mcp_tools",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::UnavailableDummyTools,
+        key: "unavailable_dummy_tools",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -792,10 +857,38 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::ImageGeneration,
-        key: "image_generation",
+        id: Feature::InAppBrowser,
+        key: "in_app_browser",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::BrowserUse,
+        key: "browser_use",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::RemotePlugin,
+        key: "remote_plugin",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ExternalMigration,
+        key: "external_migration",
+        stage: Stage::Experimental {
+            name: "External migration",
+            menu_description: "Show a startup prompt when Codex detects migratable external agent config for this machine or project.",
+            announcement: "",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ImageGeneration,
+        key: "image_generation",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::SkillMcpDependencyInstall,
@@ -824,12 +917,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianApproval,
         key: "guardian_approval",
-        stage: Stage::Experimental {
-            name: "Guardian Approvals",
-            menu_description: "When Codex needs approval for higher-risk actions (e.g. sandbox escapes or blocked network access), route eligible approval requests to a carefully-prompted security reviewer subagent rather than blocking the agent on your input. This can consume significantly more tokens because it runs a subagent on every approval request.",
-            announcement: "",
-        },
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CollaborationModes,
@@ -874,6 +963,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ImageDetailOriginal,
+        key: "image_detail_original",
+        stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::TuiAppServer,
         key: "tui_app_server",
         stage: Stage::Removed,
@@ -898,6 +993,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::WorkspaceOwnerUsageNudge,
+        key: "workspace_owner_usage_nudge",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ResponsesWebsockets,
         key: "responses_websockets",
         stage: Stage::Removed,
@@ -908,6 +1009,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "responses_websockets_v2",
         stage: Stage::Removed,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WorkspaceDependencies,
+        key: "workspace_dependencies",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
 ];
 

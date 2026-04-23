@@ -10,7 +10,7 @@ ExecRequest for execution.
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::exec::StdoutStream;
-use crate::exec::WindowsRestrictedTokenFilesystemOverlay;
+use crate::exec::WindowsSandboxFilesystemOverrides;
 use crate::exec::execute_exec_request;
 #[cfg(target_os = "macos")]
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
@@ -33,22 +33,29 @@ pub(crate) struct ExecOptions {
     pub(crate) capture_policy: ExecCapturePolicy,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ExecServerEnvConfig {
+    pub(crate) policy: codex_exec_server::ExecEnvPolicy,
+    pub(crate) local_policy_env: HashMap<String, String>,
+}
+
 #[derive(Debug)]
 pub struct ExecRequest {
     pub command: Vec<String>,
     pub cwd: AbsolutePathBuf,
     pub env: HashMap<String, String>,
+    pub(crate) exec_server_env_config: Option<ExecServerEnvConfig>,
     pub network: Option<NetworkProxy>,
     pub expiration: ExecExpiration,
     pub capture_policy: ExecCapturePolicy,
     pub sandbox: SandboxType,
+    pub windows_sandbox_policy_cwd: AbsolutePathBuf,
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
     pub sandbox_policy: SandboxPolicy,
     pub file_system_sandbox_policy: FileSystemSandboxPolicy,
     pub network_sandbox_policy: NetworkSandboxPolicy,
-    pub(crate) windows_restricted_token_filesystem_overlay:
-        Option<WindowsRestrictedTokenFilesystemOverlay>,
+    pub(crate) windows_sandbox_filesystem_overrides: Option<WindowsSandboxFilesystemOverrides>,
     pub arg0: Option<String>,
 }
 
@@ -69,20 +76,23 @@ impl ExecRequest {
         network_sandbox_policy: NetworkSandboxPolicy,
         arg0: Option<String>,
     ) -> Self {
+        let windows_sandbox_policy_cwd = cwd.clone();
         Self {
             command,
             cwd,
             env,
+            exec_server_env_config: None,
             network,
             expiration,
             capture_policy,
             sandbox,
+            windows_sandbox_policy_cwd,
             windows_sandbox_level,
             windows_sandbox_private_desktop,
             sandbox_policy,
             file_system_sandbox_policy,
             network_sandbox_policy,
-            windows_restricted_token_filesystem_overlay: None,
+            windows_sandbox_filesystem_overrides: None,
             arg0,
         }
     }
@@ -90,6 +100,7 @@ impl ExecRequest {
     pub(crate) fn from_sandbox_exec_request(
         request: SandboxExecRequest,
         options: ExecOptions,
+        windows_sandbox_policy_cwd: AbsolutePathBuf,
     ) -> Self {
         let SandboxExecRequest {
             command,
@@ -122,16 +133,18 @@ impl ExecRequest {
             command,
             cwd,
             env,
+            exec_server_env_config: None,
             network,
             expiration,
             capture_policy,
             sandbox,
+            windows_sandbox_policy_cwd,
             windows_sandbox_level,
             windows_sandbox_private_desktop,
             sandbox_policy,
             file_system_sandbox_policy,
             network_sandbox_policy,
-            windows_restricted_token_filesystem_overlay: None,
+            windows_sandbox_filesystem_overrides: None,
             arg0,
         }
     }

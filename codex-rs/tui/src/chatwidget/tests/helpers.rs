@@ -10,8 +10,9 @@ pub(super) async fn test_config() -> Config {
         .keep();
     let mut config =
         Config::load_default_with_cli_overrides_for_codex_home(codex_home.clone(), Vec::new())
+            .await
             .expect("config");
-    config.codex_home = codex_home.clone();
+    config.codex_home = codex_home.abs();
     config.sqlite_home = codex_home.clone();
     config.log_dir = codex_home.join("log");
     config.cwd = PathBuf::from(test_path_display("/tmp/project")).abs();
@@ -105,11 +106,12 @@ pub(super) fn snapshot(percent: f64) -> RateLimitSnapshot {
         secondary: None,
         credits: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     }
 }
 
 pub(super) fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
-    let model_info = codex_core::test_support::construct_model_info_offline(model, config);
+    let model_info = crate::legacy_core::test_support::construct_model_info_offline(model, config);
     SessionTelemetry::new(
         ThreadId::new(),
         model,
@@ -131,7 +133,7 @@ pub(super) fn test_model_catalog(config: &Config) -> Arc<ModelCatalog> {
             .enabled(Feature::DefaultModeRequestUserInput),
     };
     Arc::new(ModelCatalog::new(
-        codex_core::test_support::all_model_presets().clone(),
+        crate::legacy_core::test_support::all_model_presets().clone(),
         collaboration_modes_config,
     ))
 }
@@ -148,9 +150,9 @@ pub(super) async fn make_chatwidget_manual(
     let app_event_tx = AppEventSender::new(tx_raw);
     let (op_tx, op_rx) = unbounded_channel::<Op>();
     let mut cfg = test_config().await;
-    let resolved_model = model_override
-        .map(str::to_owned)
-        .unwrap_or_else(|| codex_core::test_support::get_model_offline(cfg.model.as_deref()));
+    let resolved_model = model_override.map(str::to_owned).unwrap_or_else(|| {
+        crate::legacy_core::test_support::get_model_offline(cfg.model.as_deref())
+    });
     if let Some(model) = model_override {
         cfg.model = Some(model.to_string());
     }
@@ -179,6 +181,7 @@ pub(super) async fn make_chatwidget_manual(
     };
     let current_collaboration_mode = base_mode;
     let active_collaboration_mask = collaboration_modes::default_mask(model_catalog.as_ref());
+    let effective_service_tier = cfg.service_tier;
     let mut widget = ChatWidget {
         app_event_tx,
         codex_op_target: super::CodexOpTarget::Direct(op_tx),
@@ -186,6 +189,7 @@ pub(super) async fn make_chatwidget_manual(
         active_cell: None,
         active_cell_revision: 0,
         config: cfg,
+        effective_service_tier,
         current_collaboration_mode,
         active_collaboration_mask,
         has_chatgpt_account: false,
@@ -199,15 +203,22 @@ pub(super) async fn make_chatwidget_manual(
         refreshing_status_outputs: Vec::new(),
         next_status_refresh_request_id: 0,
         plan_type: None,
+        codex_rate_limit_reached_type: None,
         rate_limit_warnings: RateLimitWarningState::default(),
         rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
+        add_credits_nudge_email_in_flight: None,
         adaptive_chunking: crate::streaming::chunking::AdaptiveChunkingPolicy::default(),
         stream_controller: None,
         plan_stream_controller: None,
+        clipboard_lease: None,
         pending_guardian_review_status: PendingGuardianReviewStatus::default(),
         terminal_title_status_kind: TerminalTitleStatusKind::Working,
-        last_copyable_output: None,
-        pending_turn_copyable_output: None,
+        last_agent_markdown: None,
+        agent_turn_markdowns: Vec::new(),
+        visible_user_turn_count: 0,
+        copy_history_evicted_by_rollback: false,
+        latest_proposed_plan_markdown: None,
+        saw_copy_source_this_turn: false,
         running_commands: HashMap::new(),
         collab_agent_metadata: HashMap::new(),
         pending_collab_spawn_requests: HashMap::new(),
@@ -230,6 +241,7 @@ pub(super) async fn make_chatwidget_manual(
         connectors_partial_snapshot: None,
         plugin_install_apps_needing_auth: Vec::new(),
         plugin_install_auth_flow: None,
+        plugins_active_tab_id: None,
         connectors_prefetch_in_flight: false,
         connectors_force_refetch_pending: false,
         plugins_cache: PluginsCacheState::default(),
@@ -238,16 +250,24 @@ pub(super) async fn make_chatwidget_manual(
         reasoning_buffer: String::new(),
         full_reasoning_buffer: String::new(),
         current_status: StatusIndicatorState::working(),
+        active_hook_cell: None,
         retry_status_header: None,
         pending_status_indicator_restore: false,
         suppress_queue_autosend: false,
         thread_id: None,
+        last_turn_id: None,
         thread_name: None,
+        thread_rename_block_message: None,
+        active_side_conversation: false,
+        normal_placeholder_text: "Ask Codex to do anything".to_string(),
+        side_placeholder_text: "Check recently modified functions for compatibility".to_string(),
         forked_from: None,
+        interrupted_turn_notice_mode: InterruptedTurnNoticeMode::Default,
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
         startup_tooltip_override: None,
         queued_user_messages: VecDeque::new(),
+        user_turn_pending_start: false,
         rejected_steers_queue: VecDeque::new(),
         pending_steers: VecDeque::new(),
         submit_pending_steers_after_interrupt: false,
@@ -272,6 +292,7 @@ pub(super) async fn make_chatwidget_manual(
         feedback: codex_feedback::CodexFeedback::new(),
         current_rollout_path: None,
         current_cwd: None,
+        instruction_source_paths: Vec::new(),
         session_network_proxy: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -477,7 +498,7 @@ pub(super) fn begin_exec_with_source(
     let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
     let parsed_cmd: Vec<ParsedCommand> =
         codex_shell_command::parse_command::parse_command(&command);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = AbsolutePathBuf::current_dir().expect("current dir");
     let interaction_input = None;
     let event = ExecCommandBeginEvent {
         call_id: call_id.to_string(),
@@ -503,7 +524,7 @@ pub(super) fn begin_unified_exec_startup(
     raw_cmd: &str,
 ) -> ExecCommandBeginEvent {
     let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = AbsolutePathBuf::current_dir().expect("current dir");
     let event = ExecCommandBeginEvent {
         call_id: call_id.to_string(),
         process_id: Some(process_id.to_string()),
@@ -664,6 +685,35 @@ pub(super) fn active_blob(chat: &ChatWidget) -> String {
     lines_to_single_string(&lines)
 }
 
+pub(super) fn active_hook_blob(chat: &ChatWidget) -> String {
+    let Some(cell) = chat.active_hook_cell.as_ref() else {
+        return "<empty>\n".to_string();
+    };
+    let lines = cell.display_lines(/*width*/ 80);
+    lines_to_single_string(&lines)
+}
+
+pub(super) fn expire_quiet_hook_linger(chat: &mut ChatWidget) {
+    if let Some(cell) = chat.active_hook_cell.as_mut() {
+        cell.expire_quiet_runs_now_for_test();
+    }
+    chat.pre_draw_tick();
+}
+
+pub(super) fn reveal_running_hooks(chat: &mut ChatWidget) {
+    if let Some(cell) = chat.active_hook_cell.as_mut() {
+        cell.reveal_running_runs_now_for_test();
+    }
+    chat.pre_draw_tick();
+}
+
+pub(super) fn reveal_running_hooks_after_delayed_redraw(chat: &mut ChatWidget) {
+    if let Some(cell) = chat.active_hook_cell.as_mut() {
+        cell.reveal_running_runs_after_delayed_redraw_for_test();
+    }
+    chat.pre_draw_tick();
+}
+
 pub(super) fn get_available_model(chat: &ChatWidget, model: &str) -> ModelPreset {
     let models = chat
         .model_catalog
@@ -689,9 +739,9 @@ pub(super) async fn assert_shift_left_edits_most_recent_queued_message_for_termi
 
     // Seed two queued messages.
     chat.queued_user_messages
-        .push_back(UserMessage::from("first queued".to_string()));
+        .push_back(UserMessage::from("first queued".to_string()).into());
     chat.queued_user_messages
-        .push_back(UserMessage::from("second queued".to_string()));
+        .push_back(UserMessage::from("second queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
     // Press Shift+Left to edit the most recent (last) queued message.
@@ -822,8 +872,11 @@ pub(super) fn plugins_test_interface(
         default_prompt: None,
         brand_color: None,
         composer_icon: None,
+        composer_icon_url: None,
         logo: None,
+        logo_url: None,
         screenshots: Vec::new(),
+        screenshot_urls: Vec::new(),
     }
 }
 
@@ -859,7 +912,7 @@ pub(super) fn plugins_test_curated_marketplace(
 ) -> PluginMarketplaceEntry {
     PluginMarketplaceEntry {
         name: OPENAI_CURATED_MARKETPLACE_NAME.to_string(),
-        path: plugins_test_absolute_path("marketplaces/chatgpt"),
+        path: Some(plugins_test_absolute_path("marketplaces/chatgpt")),
         interface: Some(MarketplaceInterface {
             display_name: Some("ChatGPT Marketplace".to_string()),
         }),
@@ -870,7 +923,7 @@ pub(super) fn plugins_test_curated_marketplace(
 pub(super) fn plugins_test_repo_marketplace(plugins: Vec<PluginSummary>) -> PluginMarketplaceEntry {
     PluginMarketplaceEntry {
         name: "repo".to_string(),
-        path: plugins_test_absolute_path("marketplaces/repo"),
+        path: Some(plugins_test_absolute_path("marketplaces/repo")),
         interface: Some(MarketplaceInterface {
             display_name: Some("Repo Marketplace".to_string()),
         }),
@@ -884,7 +937,6 @@ pub(super) fn plugins_test_response(
     PluginListResponse {
         marketplaces,
         marketplace_load_errors: Vec::new(),
-        remote_sync_error: None,
         featured_plugin_ids: Vec::new(),
     }
 }
@@ -908,7 +960,7 @@ pub(super) fn plugins_test_detail(
 ) -> PluginDetail {
     PluginDetail {
         marketplace_name: "ChatGPT Marketplace".to_string(),
-        marketplace_path: plugins_test_absolute_path("marketplaces/chatgpt"),
+        marketplace_path: Some(plugins_test_absolute_path("marketplaces/chatgpt")),
         summary,
         description: description.map(str::to_string),
         skills: skills
@@ -918,7 +970,9 @@ pub(super) fn plugins_test_detail(
                 description: format!("{name} description"),
                 short_description: None,
                 interface: None,
-                path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+                path: Some(plugins_test_absolute_path(&format!(
+                    "skills/{name}/SKILL.md"
+                ))),
                 enabled: true,
             })
             .collect(),
@@ -966,7 +1020,8 @@ pub(super) async fn assert_hook_events_snapshot(
                 handler_type: codex_protocol::protocol::HookHandlerType::Command,
                 execution_mode: codex_protocol::protocol::HookExecutionMode::Sync,
                 scope: codex_protocol::protocol::HookScope::Turn,
-                source_path: PathBuf::from("/tmp/hooks.json"),
+                source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+                source: codex_protocol::protocol::HookSource::User,
                 display_order: 0,
                 status: codex_protocol::protocol::HookRunStatus::Running,
                 status_message: Some(status_message.to_string()),
@@ -977,6 +1032,18 @@ pub(super) async fn assert_hook_events_snapshot(
             },
         }),
     });
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "hook start should update the live hook cell instead of writing history"
+    );
+    reveal_running_hooks(&mut chat);
+    assert!(
+        active_hook_blob(&chat).contains(&format!(
+            "Running {} hook: {status_message}",
+            hook_event_label(event_name)
+        )),
+        "hook start should render in the live hook cell"
+    );
 
     chat.handle_codex_event(Event {
         id: "hook-1".into(),
@@ -988,7 +1055,8 @@ pub(super) async fn assert_hook_events_snapshot(
                 handler_type: codex_protocol::protocol::HookHandlerType::Command,
                 execution_mode: codex_protocol::protocol::HookExecutionMode::Sync,
                 scope: codex_protocol::protocol::HookScope::Turn,
-                source_path: PathBuf::from("/tmp/hooks.json"),
+                source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+                source: codex_protocol::protocol::HookSource::User,
                 display_order: 0,
                 status: codex_protocol::protocol::HookRunStatus::Completed,
                 status_message: Some(status_message.to_string()),
@@ -1015,4 +1083,15 @@ pub(super) async fn assert_hook_events_snapshot(
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert_chatwidget_snapshot!(snapshot_name, combined);
+}
+
+fn hook_event_label(event_name: codex_protocol::protocol::HookEventName) -> &'static str {
+    match event_name {
+        codex_protocol::protocol::HookEventName::PreToolUse => "PreToolUse",
+        codex_protocol::protocol::HookEventName::PermissionRequest => "PermissionRequest",
+        codex_protocol::protocol::HookEventName::PostToolUse => "PostToolUse",
+        codex_protocol::protocol::HookEventName::SessionStart => "SessionStart",
+        codex_protocol::protocol::HookEventName::UserPromptSubmit => "UserPromptSubmit",
+        codex_protocol::protocol::HookEventName::Stop => "Stop",
+    }
 }

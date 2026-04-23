@@ -1,15 +1,21 @@
 use crate::agent::AgentStatus;
-use crate::codex::Codex;
-use crate::codex::SteerInputError;
 use crate::config::ConstraintResult;
 use crate::file_watcher::WatchRegistration;
+use crate::session::Codex;
+use crate::session::SessionSettingsUpdate;
+use crate::session::SteerInputError;
 use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -19,10 +25,14 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use rmcp::model::ReadResourceRequestParams;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
@@ -37,11 +47,29 @@ pub struct ThreadConfigSnapshot {
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox_policy: SandboxPolicy,
-    pub cwd: PathBuf,
+    pub permission_profile: PermissionProfile,
+    pub cwd: AbsolutePathBuf,
     pub ephemeral: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub personality: Option<Personality>,
     pub session_source: SessionSource,
+}
+
+/// Turn context overrides that app-server validates before starting a turn.
+#[derive(Clone, Default)]
+pub struct CodexThreadTurnContextOverrides {
+    pub cwd: Option<PathBuf>,
+    pub approval_policy: Option<AskForApproval>,
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+    pub sandbox_policy: Option<SandboxPolicy>,
+    pub permission_profile: Option<PermissionProfile>,
+    pub windows_sandbox_level: Option<WindowsSandboxLevel>,
+    pub model: Option<String>,
+    pub effort: Option<Option<ReasoningEffort>>,
+    pub summary: Option<ReasoningSummary>,
+    pub service_tier: Option<Option<ServiceTier>>,
+    pub collaboration_mode: Option<CollaborationMode>,
+    pub personality: Option<Personality>,
 }
 
 pub struct CodexThread {
@@ -81,8 +109,8 @@ impl CodexThread {
     }
 
     #[doc(hidden)]
-    pub async fn flush_rollout(&self) {
-        self.codex.session.flush_rollout().await;
+    pub async fn flush_rollout(&self) -> std::io::Result<()> {
+        self.codex.session.flush_rollout().await
     }
 
     pub async fn submit_with_trace(
@@ -93,12 +121,20 @@ impl CodexThread {
         self.codex.submit_with_trace(op, trace).await
     }
 
+    /// Persist whether this thread is eligible for future memory generation.
+    pub async fn set_thread_memory_mode(&self, mode: ThreadMemoryMode) -> anyhow::Result<()> {
+        self.codex.set_thread_memory_mode(mode).await
+    }
+
     pub async fn steer_input(
         &self,
         input: Vec<UserInput>,
         expected_turn_id: Option<&str>,
+        responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Result<String, SteerInputError> {
-        self.codex.steer_input(input, expected_turn_id).await
+        self.codex
+            .steer_input(input, expected_turn_id, responsesapi_client_metadata)
+            .await
     }
 
     pub async fn set_app_server_client_info(
@@ -109,6 +145,51 @@ impl CodexThread {
         self.codex
             .set_app_server_client_info(app_server_client_name, app_server_client_version)
             .await
+    }
+
+    /// Validate persistent turn context overrides without committing them.
+    pub async fn validate_turn_context_overrides(
+        &self,
+        overrides: CodexThreadTurnContextOverrides,
+    ) -> ConstraintResult<()> {
+        let CodexThreadTurnContextOverrides {
+            cwd,
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy,
+            permission_profile,
+            windows_sandbox_level,
+            model,
+            effort,
+            summary,
+            service_tier,
+            collaboration_mode,
+            personality,
+        } = overrides;
+        let collaboration_mode = if let Some(collaboration_mode) = collaboration_mode {
+            collaboration_mode
+        } else {
+            self.codex
+                .session
+                .collaboration_mode()
+                .await
+                .with_updates(model, effort, /*developer_instructions*/ None)
+        };
+
+        let updates = SessionSettingsUpdate {
+            cwd,
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy,
+            permission_profile,
+            windows_sandbox_level,
+            collaboration_mode: Some(collaboration_mode),
+            reasoning_summary: summary,
+            service_tier,
+            personality,
+            ..Default::default()
+        };
+        self.codex.session.validate_settings(&updates).await
     }
 
     /// Use sparingly: this is intended to be removed soon.
@@ -130,6 +211,17 @@ impl CodexThread {
 
     pub(crate) async fn total_token_usage(&self) -> Option<TokenUsage> {
         self.codex.session.total_token_usage().await
+    }
+
+    /// Returns the complete token usage snapshot currently cached for this thread.
+    ///
+    /// This accessor is intentionally narrower than direct session access: it lets
+    /// app-server lifecycle paths replay restored usage after resume or fork without
+    /// exposing broader session mutation authority. A caller that only reads
+    /// `total_token_usage` would drop last-turn usage and make the v2
+    /// `thread/tokenUsage/updated` payload incomplete.
+    pub async fn token_usage_info(&self) -> Option<TokenUsageInfo> {
+        self.codex.session.token_usage_info().await
     }
 
     /// Records a user-role session-prefix message without creating a new user turn boundary.
@@ -188,6 +280,29 @@ impl CodexThread {
         Ok(submission_id)
     }
 
+    /// Append raw Responses API items to the thread's model-visible history.
+    pub async fn inject_response_items(&self, items: Vec<ResponseItem>) -> CodexResult<()> {
+        if items.is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "items must not be empty".to_string(),
+            ));
+        }
+
+        let turn_context = self.codex.session.new_default_turn().await;
+        if self.codex.session.reference_context_item().await.is_none() {
+            self.codex
+                .session
+                .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+                .await;
+        }
+        self.codex
+            .session
+            .record_conversation_items(turn_context.as_ref(), &items)
+            .await;
+        self.codex.session.flush_rollout().await?;
+        Ok(())
+    }
+
     pub fn rollout_path(&self) -> Option<PathBuf> {
         self.rollout_path.clone()
     }
@@ -218,6 +333,19 @@ impl CodexThread {
             .await?;
 
         Ok(serde_json::to_value(result)?)
+    }
+
+    pub async fn call_mcp_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+    ) -> anyhow::Result<CallToolResult> {
+        self.codex
+            .session
+            .call_tool(server, tool, arguments, meta)
+            .await
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {

@@ -19,6 +19,8 @@ use crate::protocol::FsReadDirectoryParams;
 use crate::protocol::FsReadFileParams;
 use crate::protocol::FsRemoveParams;
 use crate::protocol::FsWriteFileParams;
+use crate::protocol::HTTP_REQUEST_METHOD;
+use crate::protocol::HttpRequestParams;
 use crate::protocol::INITIALIZE_METHOD;
 use crate::protocol::INITIALIZED_METHOD;
 use crate::protocol::InitializeParams;
@@ -30,16 +32,22 @@ use crate::server::ExecServerHandler;
 
 pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
     let mut router = RpcRouter::new();
-    router.request(
-        INITIALIZE_METHOD,
-        |handler: Arc<ExecServerHandler>, _params: InitializeParams| async move {
-            handler.initialize()
-        },
-    );
     router.notification(
         INITIALIZED_METHOD,
         |handler: Arc<ExecServerHandler>, _params: serde_json::Value| async move {
             handler.initialized()
+        },
+    );
+    router.request(
+        INITIALIZE_METHOD,
+        |handler: Arc<ExecServerHandler>, params: InitializeParams| async move {
+            handler.initialize(params).await
+        },
+    );
+    router.request_with_id(
+        HTTP_REQUEST_METHOD,
+        |handler: Arc<ExecServerHandler>, request_id, params: HttpRequestParams| async move {
+            handler.http_request(request_id, params).await
         },
     );
     router.request(

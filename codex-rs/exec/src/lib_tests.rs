@@ -1,6 +1,8 @@
 use super::*;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_utils_absolute_path::test_support::PathBufExt;
+use codex_utils_absolute_path::test_support::test_path_buf;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TraceId;
 use opentelemetry::trace::TracerProvider as _;
@@ -250,7 +252,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
         updated_at: 0,
         status: codex_app_server_protocol::ThreadStatus::Idle,
         path: None,
-        cwd: PathBuf::from("/tmp/project"),
+        cwd: test_path_buf("/tmp/project").abs(),
         cli_version: "0.0.0-test".to_string(),
         source: codex_app_server_protocol::SessionSource::Exec,
         agent_nickname: None,
@@ -359,6 +361,11 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
         params.approvals_reviewer,
         Some(codex_app_server_protocol::ApprovalsReviewer::User)
     );
+    assert_eq!(params.sandbox, None);
+    assert_eq!(
+        params.permission_profile,
+        Some(config.permissions.permission_profile().into())
+    );
 }
 
 #[tokio::test]
@@ -368,7 +375,7 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
-            approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
             ..Default::default()
         })
         .fallback_cwd(Some(cwd.path().to_path_buf()))
@@ -380,7 +387,7 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
 
     assert_eq!(
         params.approvals_reviewer,
-        Some(codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent)
+        Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview)
     );
 }
 
@@ -397,7 +404,7 @@ fn session_configured_from_thread_response_uses_review_policy_from_response() {
             updated_at: 0,
             status: codex_app_server_protocol::ThreadStatus::Idle,
             path: Some(PathBuf::from("/tmp/rollout.jsonl")),
-            cwd: PathBuf::from("/tmp"),
+            cwd: test_path_buf("/tmp").abs(),
             cli_version: "0.0.0".to_string(),
             source: codex_app_server_protocol::SessionSource::Cli,
             agent_nickname: None,
@@ -409,9 +416,10 @@ fn session_configured_from_thread_response_uses_review_policy_from_response() {
         model: "gpt-5.4".to_string(),
         model_provider: "openai".to_string(),
         service_tier: None,
-        cwd: PathBuf::from("/tmp"),
+        cwd: test_path_buf("/tmp").abs(),
+        instruction_sources: Vec::new(),
         approval_policy: codex_app_server_protocol::AskForApproval::OnRequest,
-        approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent,
+        approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
         sandbox: codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
             read_only_access: codex_app_server_protocol::ReadOnlyAccess::FullAccess,
@@ -419,14 +427,18 @@ fn session_configured_from_thread_response_uses_review_policy_from_response() {
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         },
+        permission_profile: Some(
+            codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+                &codex_protocol::protocol::SandboxPolicy::new_workspace_write_policy(),
+                &test_path_buf("/tmp"),
+            )
+            .into(),
+        ),
         reasoning_effort: None,
     };
 
     let event = session_configured_from_thread_start_response(&response)
         .expect("build bootstrap session configured event");
 
-    assert_eq!(
-        event.approvals_reviewer,
-        ApprovalsReviewer::GuardianSubagent
-    );
+    assert_eq!(event.approvals_reviewer, ApprovalsReviewer::AutoReview);
 }

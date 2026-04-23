@@ -24,6 +24,7 @@ pub const WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY: &str = "ws_request_h
 pub struct CompactionInput<'a> {
     pub model: &'a str,
     pub input: &'a [ResponseItem],
+    #[serde(skip_serializing_if = "str::is_empty")]
     pub instructions: &'a str,
     pub tools: Vec<Value>,
     pub parallel_tool_calls: bool,
@@ -79,6 +80,11 @@ pub enum ResponseEvent {
         token_usage: Option<TokenUsage>,
     },
     OutputTextDelta(String),
+    ToolCallInputDelta {
+        item_id: String,
+        call_id: Option<String>,
+        delta: String,
+    },
     ReasoningSummaryDelta {
         delta: String,
         summary_index: i64,
@@ -153,6 +159,7 @@ impl From<VerbosityConfig> for OpenAiVerbosity {
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponsesApiRequest {
     pub model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub instructions: String,
     pub input: Vec<ResponseItem>,
     pub tools: Vec<serde_json::Value>,
@@ -198,6 +205,7 @@ impl From<&ResponsesApiRequest> for ResponseCreateWsRequest {
 #[derive(Debug, Serialize)]
 pub struct ResponseCreateWsRequest {
     pub model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub instructions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
@@ -254,6 +262,7 @@ pub enum ResponsesWsRequest {
 pub fn create_text_param_for_request(
     verbosity: Option<VerbosityConfig>,
     output_schema: &Option<Value>,
+    output_schema_strict: bool,
 ) -> Option<TextControls> {
     if verbosity.is_none() && output_schema.is_none() {
         return None;
@@ -263,7 +272,7 @@ pub fn create_text_param_for_request(
         verbosity: verbosity.map(std::convert::Into::into),
         format: output_schema.as_ref().map(|schema| TextFormat {
             r#type: TextFormatType::JsonSchema,
-            strict: true,
+            strict: output_schema_strict,
             schema: schema.clone(),
             name: "codex_output_schema".to_string(),
         }),

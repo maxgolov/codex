@@ -2,11 +2,10 @@ use super::*;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::render_input_preview;
-use crate::agent::role::DEFAULT_ROLE_NAME;
-use crate::agent::role::apply_role_to_config;
-
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
+use crate::agent::role::DEFAULT_ROLE_NAME;
+use crate::agent::role::apply_role_to_config;
 
 pub(crate) struct Handler;
 
@@ -61,40 +60,45 @@ impl ToolHandler for Handler {
             .await;
         let mut config =
             build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
-        apply_requested_spawn_agent_model_overrides(
-            &session,
-            turn.as_ref(),
-            &mut config,
-            args.model.as_deref(),
-            args.reasoning_effort,
-        )
-        .await?;
-        apply_role_to_config(&mut config, role_name)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
+        if args.fork_context {
+            reject_full_fork_spawn_overrides(
+                role_name,
+                args.model.as_deref(),
+                args.reasoning_effort,
+            )?;
+        } else {
+            apply_requested_spawn_agent_model_overrides(
+                &session,
+                turn.as_ref(),
+                &mut config,
+                args.model.as_deref(),
+                args.reasoning_effort,
+            )
+            .await?;
+            apply_role_to_config(&mut config, role_name)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+        }
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         apply_spawn_agent_overrides(&mut config, child_depth);
 
-        let result = session
-            .services
-            .agent_control
-            .spawn_agent_with_metadata(
-                config,
-                input_items,
-                Some(thread_spawn_source(
-                    session.conversation_id,
-                    &turn.session_source,
-                    child_depth,
-                    role_name,
-                    /*task_name*/ None,
-                )?),
-                SpawnAgentOptions {
-                    fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
-                    fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
-                },
-            )
-            .await
-            .map_err(collab_spawn_error);
+        let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(
+            config,
+            input_items,
+            Some(thread_spawn_source(
+                session.conversation_id,
+                &turn.session_source,
+                child_depth,
+                role_name,
+                /*task_name*/ None,
+            )?),
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
+                fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
+            },
+        ))
+        .await
+        .map_err(collab_spawn_error);
         let (new_thread_id, new_agent_metadata, status) = match &result {
             Ok(spawned_agent) => (
                 Some(spawned_agent.thread_id),

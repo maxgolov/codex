@@ -34,6 +34,7 @@ pub use config::Config;
 pub use config::RolloutConfig;
 pub use config::RolloutConfigView;
 pub use list::Cursor;
+pub use list::SortDirection;
 pub use list::ThreadItem;
 pub use list::ThreadListConfig;
 pub use list::ThreadListLayout;
@@ -48,16 +49,18 @@ pub use list::get_threads_in_root;
 pub use list::parse_cursor;
 pub use list::read_head_for_summary;
 pub use list::read_session_meta_line;
+pub use list::read_thread_item_from_rollout;
 pub use list::rollout_date_parts;
 pub use metadata::builder_from_items;
 pub use policy::EventPersistenceMode;
 pub use policy::should_persist_response_item_for_memories;
 pub use recorder::RolloutRecorder;
 pub use recorder::RolloutRecorderParams;
+pub use recorder::append_rollout_item_to_path;
 pub use session_index::append_thread_name;
+pub use session_index::find_thread_meta_by_name_str;
 pub use session_index::find_thread_name_by_id;
 pub use session_index::find_thread_names_by_ids;
-pub use session_index::find_thread_path_by_name_str;
 pub use state_db::StateDbHandle;
 
 #[cfg(test)]

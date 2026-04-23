@@ -30,6 +30,8 @@ use std::sync::Arc;
 use crate::app::App;
 use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
+#[cfg(test)]
+use crate::history_cell::AgentMessageCell;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::pager_overlay::Overlay;
@@ -480,6 +482,8 @@ impl App {
         if !trim_transcript_cells_drop_last_n_user_turns(&mut self.transcript_cells, num_turns) {
             return false;
         }
+        self.chat_widget
+            .truncate_agent_copy_history_to_user_turn_count(user_count(&self.transcript_cells));
         self.sync_overlay_after_transcript_trim();
         self.backtrack_render_pending = true;
         true
@@ -501,6 +505,8 @@ impl App {
             &mut self.transcript_cells,
             pending.selection.nth_user_message,
         ) {
+            self.chat_widget
+                .truncate_agent_copy_history_to_user_turn_count(user_count(&self.transcript_cells));
             self.sync_overlay_after_transcript_trim();
             self.backtrack_render_pending = true;
         }
@@ -633,6 +639,34 @@ fn user_positions_iter(
         .enumerate()
         .skip(start)
         .filter_map(move |(idx, cell)| (type_of(cell) == user_type).then_some(idx))
+}
+
+#[cfg(test)]
+fn agent_group_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> usize {
+    agent_group_positions_iter(cells).count()
+}
+
+#[cfg(test)]
+fn agent_group_positions_iter(
+    cells: &[Arc<dyn crate::history_cell::HistoryCell>],
+) -> impl Iterator<Item = usize> + '_ {
+    let session_start_type = TypeId::of::<SessionInfoCell>();
+    let type_of = |cell: &Arc<dyn crate::history_cell::HistoryCell>| cell.as_any().type_id();
+
+    let start = cells
+        .iter()
+        .rposition(|cell| type_of(cell) == session_start_type)
+        .map_or(0, |idx| idx + 1);
+
+    cells
+        .iter()
+        .enumerate()
+        .skip(start)
+        .filter_map(move |(idx, cell)| {
+            let is_agent = cell.as_any().downcast_ref::<AgentMessageCell>().is_some();
+            let is_copy_source_group = is_agent && !cell.is_stream_continuation();
+            is_copy_source_group.then_some(idx)
+        })
 }
 
 #[cfg(test)]
@@ -830,5 +864,25 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(intro_text, "• intro");
+    }
+
+    #[test]
+    fn agent_group_count_ignores_context_compacted_marker() {
+        let cells: Vec<Arc<dyn HistoryCell>> = vec![
+            Arc::new(AgentMessageCell::new(
+                vec![Line::from("first")],
+                /*is_first_line*/ true,
+            )) as Arc<dyn HistoryCell>,
+            Arc::new(crate::history_cell::new_info_event(
+                "Context compacted".to_string(),
+                /*hint*/ None,
+            )) as Arc<dyn HistoryCell>,
+            Arc::new(AgentMessageCell::new(
+                vec![Line::from("second")],
+                /*is_first_line*/ true,
+            )) as Arc<dyn HistoryCell>,
+        ];
+
+        assert_eq!(agent_group_count(&cells), 2);
     }
 }
