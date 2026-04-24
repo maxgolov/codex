@@ -224,7 +224,7 @@ pub async fn stream_nemotron_chat(
                     .map(|c| match c {
                         ContentItem::InputText { text: t }
                         | ContentItem::OutputText { text: t } => t.as_str(),
-                        ContentItem::InputImage { image_url } => image_url.as_str(),
+                        ContentItem::InputImage { image_url, .. } => image_url.as_str(),
                     })
                     .collect::<Vec<_>>()
                     .join("");
@@ -386,10 +386,15 @@ pub async fn stream_nemotron_chat(
     debug!("Nemotron POST to {url}");
 
     // ── Execute with retries + nudge on timeout ─────────────────────────
-    let http_client = reqwest::Client::builder()
-        .timeout(request_timeout)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    //
+    // We intentionally do NOT configure a client-wide `reqwest` timeout here:
+    // that timeout applies to the entire request lifetime including reading
+    // the streaming SSE response body, which would forcibly terminate
+    // long-running streams even when data is still flowing. Instead we wrap
+    // only the `.send()` call (headers / first byte) in
+    // `tokio::time::timeout`, and let per-chunk progress be guarded by
+    // `idle_timeout` in `process_nemotron_response`.
+    let http_client = reqwest::Client::new();
     let mut attempt = 0;
     let max_retries = provider.request_max_retries();
     let mut thinking_budget = initial_thinking_budget;
@@ -417,15 +422,18 @@ pub async fn stream_nemotron_chat(
 
         debug!("Nemotron attempt {attempt}/{max_retries} (thinking_budget={thinking_budget})");
 
-        let res = http_client
+        // Apply `request_timeout` only to headers/first-byte so long-running
+        // streams are not cut off mid-flight. Per-chunk progress is enforced
+        // by `idle_timeout` inside `process_nemotron_response`.
+        let send_fut = http_client
             .post(&url)
             .headers(header_map.clone())
             .json(&payload)
-            .send()
-            .await;
+            .send();
+        let res = timeout(request_timeout, send_fut).await;
 
         match res {
-            Ok(resp) if resp.status().is_success() => {
+            Ok(Ok(resp)) if resp.status().is_success() => {
                 let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
                 // Report the resolved model so the TUI/caller sees the actual
                 // model name instead of "auto" or a partial slug.
@@ -438,7 +446,7 @@ pub async fn stream_nemotron_chat(
                 });
                 return Ok(ResponseStream { rx_event });
             }
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 let status = resp.status();
                 if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
                     let body = resp.text().await.unwrap_or_default();
@@ -464,7 +472,7 @@ pub async fn stream_nemotron_chat(
                     .unwrap_or_else(|| backoff(attempt));
                 tokio::time::sleep(delay).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if attempt > max_retries {
                     return Err(CodexErr::UnsupportedOperation(format!(
                         "Nemotron connection failed after retries: {e}"
@@ -485,6 +493,24 @@ pub async fn stream_nemotron_chat(
                     thinking_budget = reduced;
                 }
 
+                let delay = backoff(attempt);
+                tokio::time::sleep(delay).await;
+            }
+            Err(_elapsed) => {
+                // First-byte timeout — treat as a timeout for nudge purposes.
+                if attempt > max_retries {
+                    return Err(CodexErr::UnsupportedOperation(format!(
+                        "Nemotron connection timed out after {request_timeout:?} (retries exhausted)"
+                    )));
+                }
+                let reduced = (thinking_budget / THINKING_BUDGET_REDUCTION_FACTOR)
+                    .max(MIN_THINKING_BUDGET);
+                tracing::warn!(
+                    "Nemotron first-byte timed out after {request_timeout:?}; \
+                     nudging with reduced thinking_budget {thinking_budget} → {reduced} \
+                     (attempt {attempt}/{max_retries})"
+                );
+                thinking_budget = reduced;
                 let delay = backoff(attempt);
                 tokio::time::sleep(delay).await;
             }
@@ -649,6 +675,23 @@ async fn process_nemotron_response(
                                 .await;
                         }
                     }
+                }
+
+                // Emit any pending tool calls collected so far — mirrors the
+                // `[DONE]` path so a server that closes the SSE connection
+                // without sending `[DONE]` does not drop queued tool calls.
+                for (_idx, tc) in tool_calls.drain() {
+                    if let Some(item) = assistant_item.take() {
+                        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                    }
+                    let item = ResponseItem::FunctionCall {
+                        id: None,
+                        name: tc.name,
+                        namespace: None,
+                        arguments: tc.arguments,
+                        call_id: tc.id,
+                    };
+                    let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                 }
 
                 // Finalize any pending assistant message.

@@ -85,7 +85,7 @@ pub(crate) async fn stream_anthropic_messages(
                             text.push_str(t);
                             blocks.push(ContentBlockParam::Text { text: t.clone() });
                         }
-                        ContentItem::InputImage { image_url } => {
+                        ContentItem::InputImage { image_url, .. } => {
                             saw_image = true;
                             blocks.push(ContentBlockParam::Text {
                                 text: format!("[Image: {image_url}]"),
@@ -118,8 +118,14 @@ pub(crate) async fn stream_anthropic_messages(
                 call_id,
                 ..
             } => {
-                let input_value: Value =
-                    serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()));
+                // Surface malformed tool arguments rather than silently replacing
+                // them with an empty object, which could cause a tool to execute
+                // with incorrect inputs.
+                let input_value: Value = serde_json::from_str(arguments).map_err(|e| {
+                    CodexErr::UnsupportedOperation(format!(
+                        "Invalid JSON in tool arguments for `{name}`: {e}"
+                    ))
+                })?;
                 let block = ContentBlockParam::ToolUse {
                     id: call_id.clone(),
                     name: name.clone(),
@@ -502,6 +508,11 @@ async fn process_anthropic_response(
                                 arguments: state.tool_args,
                                 call_id: state.tool_id,
                             };
+                            // Preserve the Added → Done lifecycle that downstream
+                            // consumers expect for every output item.
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
+                                .await;
                             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         }
                         BlockKind::Text => {

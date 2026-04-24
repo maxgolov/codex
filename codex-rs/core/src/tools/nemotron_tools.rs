@@ -45,22 +45,30 @@ fn flatten_schema(schema: &mut Value) {
     };
 
     // If this node itself is a oneOf/anyOf, replace it with the first variant.
+    // Inspect before removing: an empty or non-array value would otherwise be
+    // silently dropped, leaving the schema subtly corrupted.
     for key in &["oneOf", "anyOf"] {
-        if let Some(variants) = obj.remove(*key)
-            && let Some(first) = variants.as_array().and_then(|a| a.first()).cloned()
+        let Some(first) = obj
+            .get(*key)
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .cloned()
+        else {
+            continue;
+        };
+        // Safe to remove now that we have a valid first variant in hand.
+        obj.remove(*key);
+        let desc = obj.remove("description");
+        let mut replacement = first;
+        // Preserve the outer description if the first variant lacks one.
+        if let Some(desc) = desc
+            && let Some(rep_obj) = replacement.as_object_mut()
         {
-            let desc = obj.remove("description");
-            let mut replacement = first;
-            // Preserve the outer description if the first variant lacks one.
-            if let Some(desc) = desc
-                && let Some(rep_obj) = replacement.as_object_mut()
-            {
-                rep_obj.entry("description").or_insert(desc);
-            }
-            *schema = replacement;
-            flatten_schema(schema);
-            return;
+            rep_obj.entry("description").or_insert(desc);
         }
+        *schema = replacement;
+        flatten_schema(schema);
+        return;
     }
 
     // Recurse into `properties`.

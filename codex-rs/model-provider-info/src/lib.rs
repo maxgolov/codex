@@ -485,6 +485,7 @@ pub fn create_anthropic_provider() -> ModelProviderInfo {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        aws: None,
     }
 }
 
@@ -529,6 +530,7 @@ pub fn create_nemotron_provider() -> ModelProviderInfo {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        aws: None,
     }
 }
 

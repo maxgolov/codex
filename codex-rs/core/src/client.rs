@@ -1536,7 +1536,7 @@ impl ModelClientSession {
                 crate::anthropic::stream_anthropic_messages(
                     prompt,
                     model_info,
-                    &self.client.state.provider,
+                    self.client.state.provider.info(),
                 )
                 .await
             }
@@ -1544,7 +1544,7 @@ impl ModelClientSession {
                 crate::nemotron::stream_nemotron_chat(
                     prompt,
                     model_info,
-                    &self.client.state.provider,
+                    self.client.state.provider.info(),
                 )
                 .await
             }
